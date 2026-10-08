@@ -160,6 +160,15 @@ pub fn target_bounds(doc: &Document, surf: &Surface) -> Rect {
     }
 }
 
+/// Is `l` live type or a shape, or a group holding one? Those can only take an affine transform.
+fn has_vector(l: &Layer) -> bool {
+    match &l.content {
+        LayerContent::Text(_) | LayerContent::Shape(_) => true,
+        LayerContent::Group(g) => g.children.iter().any(has_vector),
+        _ => false,
+    }
+}
+
 /// The locks `id` inherits from the groups around it.
 pub(crate) fn group_locks(doc: &Document, id: LayerId) -> Locks {
     doc.path_of(id).and_then(|p| Some(doc.locks_at(p.split_last()?.1))).unwrap_or_default()
@@ -374,7 +383,7 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
         (m[6].abs() < 1e-12 && m[7].abs() < 1e-12).then(|| Affine { m: [m[0] / m[8], m[3] / m[8], m[1] / m[8], m[4] / m[8], m[2] / m[8], m[5] / m[8]] });
     let interp = Interp::parse(p.get("interpolation").and_then(Value::as_str).unwrap_or("bicubic"));
     let lone = lone.is_some();
-    s.edit("Free Transform", |doc, _| {
+    s.edit("Free Transform", |doc, active| {
         let sel = doc.selection.clone();
         if lone {
             // A targeted unlinked mask, alpha channel or Quick Mask transforms by itself.
@@ -388,7 +397,24 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
             }
             return Ok(());
         }
-        let id = id.ok_or_else(|| EngineError::Other("no active layer".into()))?;
+        let mut id = id.ok_or_else(|| EngineError::Other("no active layer".into()))?;
+        // Distort / Perspective can't be stored on live type or shapes (a projective map doesn't
+        // keep Béziers as Béziers). Rather than refuse, the layer becomes a smart object first:
+        // its vector source stays editable and the placement holds the full projective map.
+        if affine.is_none() && doc.layer(id).is_some_and(has_vector) {
+            let l = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+            if l.locks.position || l.locks.all {
+                return Err(EngineError::Other(format!("layer \"{}\" is locked", l.name)));
+            }
+            let so = crate::smart_cmds::layer_to_smart(doc, l)?;
+            let new_id = so.id;
+            let path = doc.path_of(id).ok_or(EngineError::NoLayer(id))?;
+            *doc.layer_at_mut(&path).ok_or(EngineError::NoLayer(id))? = so;
+            if *active == Some(id) {
+                *active = Some(new_id);
+            }
+            id = new_id;
+        }
         let is_group = doc.layer(id).is_some_and(Layer::is_group);
         let group = group_locks(doc, id);
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
@@ -503,8 +529,11 @@ mod tests {
         let st = s.active().unwrap();
         let LayerContent::Text(t) = &st.doc.layer(LayerId(id)).unwrap().content else { panic!() };
         assert!((t.transform.m[0] - 2.0).abs() < 1e-9);
-        // Perspective on type is refused, like Photoshop.
-        assert!(s.execute("edit.transform", json!({"layer": id, "quad": [[0, 0], [10, 0], [12, 10], [-2, 10]]})).is_err());
+        // Perspective on type converts it to a smart object (the type stays editable inside).
+        s.execute("edit.transform", json!({"layer": id, "quad": [[0, 0], [10, 0], [12, 10], [-2, 10]]})).unwrap();
+        let st = s.active().unwrap();
+        let LayerContent::Smart(sm) = &st.doc.layer(st.active_layer.unwrap()).unwrap().content else { panic!("type became a smart object") };
+        assert!(sm.perspective.is_some(), "the placement keeps the projective map");
     }
 
     #[test]
@@ -516,7 +545,16 @@ mod tests {
         assert_eq!(active_bounds(&s), Rect::new(40, 15, 80, 35));
         s.execute("edit.transform", json!({"matrix": [2, 0, 0, 2, -40, -15]})).unwrap();
         assert_eq!(active_bounds(&s), Rect::new(40, 15, 120, 55));
-        assert!(s.execute("edit.transform", json!({"quad": [[40, 15], [120, 15], [130, 55], [30, 55]]})).is_err());
+        // Distort converts the shape to a smart object holding the projective placement.
+        s.execute("edit.transform", json!({"quad": [[40, 15], [120, 15], [130, 55], [30, 55]]})).unwrap();
+        let st = s.active().unwrap();
+        let id = st.active_layer.unwrap();
+        let LayerContent::Smart(sm) = &st.doc.layer(id).unwrap().content else { panic!("shape became a smart object") };
+        assert!(sm.perspective.is_some());
+        let b = active_bounds(&s);
+        assert!(b.x0 <= 31 && b.x1 >= 129 && b.y0 <= 16 && b.y1 >= 54, "{b:?}");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert!(matches!(s.active().unwrap().doc.layers.last().unwrap().content, LayerContent::Shape(_)), "one undo step restores the shape");
     }
 
     #[test]
