@@ -40,6 +40,8 @@ struct Chosen {
     id: String,
     /// A key press (not a mouse click), and the modifiers held: ⌘, ⌃, ⌥, ⇧.
     key: bool,
+    /// The key press was an auto-repeat (the keys were held).
+    repeat: bool,
     mods: [bool; 4],
 }
 
@@ -60,10 +62,11 @@ impl MacMenu {
             // equivalent is a key-down, a click a mouse-up (or ↩ inside the open menu).
             let event = MainThreadMarker::new().and_then(|mtm| NSApplication::sharedApplication(mtm).currentEvent());
             let key = event.as_ref().is_some_and(|ev| ev.r#type() == NSEventType::KeyDown);
+            let repeat = key && event.as_ref().is_some_and(|ev| ev.isARepeat());
             let flags = event.as_ref().map(|ev| ev.modifierFlags()).unwrap_or(NSEventModifierFlags::empty());
             let mods = [NSEventModifierFlags::Command, NSEventModifierFlags::Control, NSEventModifierFlags::Option, NSEventModifierFlags::Shift]
                 .map(|m| flags.contains(m));
-            let _ = tx.send(Chosen { id: e.id.0, key, mods });
+            let _ = tx.send(Chosen { id: e.id.0, key, repeat, mods });
             // Wake egui, so the item runs now rather than on the next mouse move.
             repaint.request_repaint();
         }));
@@ -205,7 +208,7 @@ impl Backend for MacMenu {
             let key =
                 e.chord.as_ref().filter(|c| chosen.key && (cmd || ctrl || !(c.cmd || c.ctrl))).map(|c| Chord { cmd, ctrl, alt, shift, key: c.key.clone() });
             out.push(match key {
-                Some(chord) if e.command != native_menu::MINIMIZE => Event::Key(chord),
+                Some(chord) if e.command != native_menu::MINIMIZE => Event::Key(chord, chosen.repeat),
                 _ => Event::Click(e.command.clone()),
             });
         }

@@ -602,7 +602,8 @@ pub enum Event {
     /// An item was chosen with the mouse (or the keyboard inside an open menu).
     Click(String),
     /// A key equivalent was pressed: the shortcut, to be handled as the key press it was.
-    Key(Chord),
+    /// `repeat`: the keys were held and the system auto-repeated the press.
+    Key(Chord, bool),
 }
 
 /// A platform's native menu bar (the desktop app implements it for macOS with muda).
@@ -636,8 +637,12 @@ impl NativeMenu {
     pub fn raw_input(&mut self, raw: &mut egui::RawInput) {
         for e in self.backend.drain() {
             match e {
-                Event::Key(chord) => {
-                    raw.events.extend(chord.key_event(true));
+                Event::Key(chord, repeat) => {
+                    let mut press = chord.key_event(true);
+                    if let Some(egui::Event::Key { repeat: r, .. }) = &mut press {
+                        *r = repeat;
+                    }
+                    raw.events.extend(press);
                     raw.events.extend(chord.key_event(false));
                 }
                 Event::Click(id) => self.clicks.push(id),
@@ -919,7 +924,7 @@ mod tests {
         let mut app = app(true);
         let ctx = egui::Context::default();
         let rulers = Chord::parse("Cmd+R").unwrap();
-        app.services.native_menu = Some(NativeMenu::new(Box::new(Fake { synced: synced.clone(), events: vec![Event::Key(rulers)] })));
+        app.services.native_menu = Some(NativeMenu::new(Box::new(Fake { synced: synced.clone(), events: vec![Event::Key(rulers, false)] })));
         let before = app.ui.extras.rulers;
         let mut raw = egui::RawInput::default();
         if let Some(m) = app.services.native_menu.as_mut() {
