@@ -13,3 +13,4 @@ target/
 
 # Local app packages from !buildApp.command
 installers/
+.DS_Store
