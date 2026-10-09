@@ -10,3 +10,6 @@ target/
 /book/output
 /craft-fonts
 *.log
+
+# Local app packages from !buildApp.command
+installers/

@@ -160,11 +160,12 @@ pub fn target_bounds(doc: &Document, surf: &Surface) -> Rect {
     }
 }
 
-/// Is `l` live type or a shape, or a group holding one? Those can only take an affine transform.
-fn has_vector(l: &Layer) -> bool {
+/// Is `l` live type, or a group holding some? Type has no path to distort until it is rasterized,
+/// so it can only take an affine transform (shapes distort as paths).
+fn has_type(l: &Layer) -> bool {
     match &l.content {
-        LayerContent::Text(_) | LayerContent::Shape(_) => true,
-        LayerContent::Group(g) => g.children.iter().any(has_vector),
+        LayerContent::Text(_) => true,
+        LayerContent::Group(g) => g.children.iter().any(has_type),
         _ => false,
     }
 }
@@ -201,12 +202,12 @@ pub(crate) fn transform_layer(doc_sel: Option<&Surface>, group: Locks, l: &mut L
             };
             t.transform = a.mul(&t.transform);
         }
-        LayerContent::Shape(sh) => {
-            let Some(a) = affine else {
-                return Err(EngineError::Other("Distort and Perspective need a rasterized shape (Layer › Rasterize › Shape)".into()));
-            };
-            crate::vector_cmds::transform_shape(sh, &a);
-        }
+        LayerContent::Shape(sh) => match affine {
+            Some(a) => crate::vector_cmds::transform_shape(sh, &a),
+            // Distort / Perspective: the path itself goes through the projective map and stays
+            // an editable shape (a rectangle keeps its four corner knots).
+            None => crate::vector_cmds::transform_shape_projective(sh, h),
+        },
         LayerContent::Smart(sm) => {
             // Smart objects keep the transform and re-render from their source afterwards
             // (`refresh_text`), so repeated transforms don't degrade the pixels. Distort and
@@ -251,9 +252,11 @@ pub(crate) fn transform_layer(doc_sel: Option<&Surface>, group: Locks, l: &mut L
     }
     if let Some(vm) = l.vector_mask.as_mut()
         && vm.linked
-        && let Some(a) = affine
     {
-        vm.path = vm.path.transform(&a);
+        vm.path = match affine {
+            Some(a) => vm.path.transform(&a),
+            None => crate::vector_cmds::transform_path_projective(&vm.path, h),
+        };
     }
     Ok(())
 }
@@ -398,10 +401,10 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
             return Ok(());
         }
         let mut id = id.ok_or_else(|| EngineError::Other("no active layer".into()))?;
-        // Distort / Perspective can't be stored on live type or shapes (a projective map doesn't
-        // keep Béziers as Béziers). Rather than refuse, the layer becomes a smart object first:
-        // its vector source stays editable and the placement holds the full projective map.
-        if affine.is_none() && doc.layer(id).is_some_and(has_vector) {
+        // Distort / Perspective can't be stored on live type (text has no path to warp). Rather
+        // than refuse, the layer becomes a smart object first: the type stays editable inside and
+        // the placement holds the full projective map.
+        if affine.is_none() && doc.layer(id).is_some_and(has_type) {
             let l = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
             if l.locks.position || l.locks.all {
                 return Err(EngineError::Other(format!("layer \"{}\" is locked", l.name)));
@@ -449,6 +452,7 @@ pub fn specs() -> Vec<CommandSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use photocraft_geom::Point;
 
     fn session() -> Session {
         let mut s = Session::new();
@@ -545,16 +549,56 @@ mod tests {
         assert_eq!(active_bounds(&s), Rect::new(40, 15, 80, 35));
         s.execute("edit.transform", json!({"matrix": [2, 0, 0, 2, -40, -15]})).unwrap();
         assert_eq!(active_bounds(&s), Rect::new(40, 15, 120, 55));
-        // Distort converts the shape to a smart object holding the projective placement.
+        // Distort keeps the shape a shape: its four corner knots land on the quad's corners.
         s.execute("edit.transform", json!({"quad": [[40, 15], [120, 15], [130, 55], [30, 55]]})).unwrap();
         let st = s.active().unwrap();
         let id = st.active_layer.unwrap();
-        let LayerContent::Smart(sm) = &st.doc.layer(id).unwrap().content else { panic!("shape became a smart object") };
-        assert!(sm.perspective.is_some());
+        let LayerContent::Shape(sh) = &st.doc.layer(id).unwrap().content else { panic!("still a shape") };
+        assert!(sh.live.is_none(), "no longer a live rectangle");
+        let knots = &sh.path.subpaths[0].knots;
+        assert_eq!(knots.len(), 4, "straight edges add no knots");
+        let mut xs: Vec<i64> = knots.iter().map(|k| k.anchor.x.round() as i64).collect();
+        xs.sort_unstable();
+        assert_eq!(xs, vec![30, 40, 120, 130], "{knots:?}");
+        for k in knots {
+            assert_eq!((k.in_ctrl, k.out_ctrl), (k.anchor, k.anchor), "corner handles stay retracted");
+        }
         let b = active_bounds(&s);
         assert!(b.x0 <= 31 && b.x1 >= 129 && b.y0 <= 16 && b.y1 >= 54, "{b:?}");
-        s.execute("edit.undo", json!({})).unwrap();
-        assert!(matches!(s.active().unwrap().doc.layers.last().unwrap().content, LayerContent::Shape(_)), "one undo step restores the shape");
+    }
+
+    #[test]
+    fn ellipse_distorts_as_a_refitted_path() {
+        use photocraft_algo::transform::Homography;
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 200, "height": 200})).unwrap();
+        s.execute("shape.create", json!({"kind": "ellipse", "rect": [20, 20, 100, 60], "fill": "#00ff00"})).unwrap();
+        let st = s.active().unwrap();
+        let LayerContent::Shape(before) = &st.doc.layer(st.active_layer.unwrap()).unwrap().content else { panic!() };
+        let before = before.path.clone();
+        let quad = [[20.0, 20.0], [120.0, 30.0], [110.0, 90.0], [30.0, 80.0]];
+        let h = Homography::rect_to_quad([20.0, 20.0, 120.0, 80.0], quad).unwrap();
+        s.execute("edit.transform", json!({"rect": [20, 20, 120, 80], "quad": quad})).unwrap();
+        let st = s.active().unwrap();
+        let LayerContent::Shape(sh) = &st.doc.layer(st.active_layer.unwrap()).unwrap().content else { panic!("still a shape") };
+        assert!(sh.path.subpaths[0].knots.len() > before.subpaths[0].knots.len(), "curves gain knots");
+        // The re-fitted curve tracks the exactly mapped one to a fraction of a pixel.
+        let bez = |q: &[Point; 4], t: f64| {
+            let u = 1.0 - t;
+            Point::new(
+                u * u * u * q[0].x + 3.0 * u * u * t * q[1].x + 3.0 * u * t * t * q[2].x + t * t * t * q[3].x,
+                u * u * u * q[0].y + 3.0 * u * u * t * q[1].y + 3.0 * u * t * t * q[2].y + t * t * t * q[3].y,
+            )
+        };
+        let after = sh.path.subpaths[0].segments();
+        for seg in before.subpaths[0].segments() {
+            for i in 0..=20 {
+                let p = bez(&seg, i as f64 / 20.0);
+                let (x, y) = h.apply(p.x, p.y);
+                let d = after.iter().flat_map(|q| (0..=200).map(move |j| bez(q, j as f64 / 200.0))).map(|m| ((m.x - x).powi(2) + (m.y - y).powi(2)).sqrt()).fold(f64::MAX, f64::min);
+                assert!(d < 0.1, "mapped point ({x:.1}, {y:.1}) is {d:.2}px from the refitted path");
+            }
+        }
     }
 
     #[test]

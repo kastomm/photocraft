@@ -456,6 +456,89 @@ pub fn translate_vectors(doc: &Document, l: &mut Layer, dx: f64, dy: f64) {
     }
 }
 
+/// Distort / Perspective of a path: every point goes through the projective map `h`. Straight
+/// segments stay straight (a homography keeps lines), so corner knots map one to one and a
+/// rectangle is still four knots. Curved segments are no longer exact cubics afterwards, so each
+/// is split into pieces (more for longer curves) and every piece re-fitted as a cubic through
+/// four mapped points, which keeps the fit well under a tenth of a pixel from the true curve.
+pub(crate) fn transform_path_projective(path: &Path, h: &photocraft_algo::transform::Homography) -> Path {
+    let map = |p: Point| {
+        let (x, y) = h.apply(p.x, p.y);
+        Point::new(x, y)
+    };
+    let eval = |s: &[Point; 4], t: f64| {
+        let u = 1.0 - t;
+        let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+        Point::new(a * s[0].x + b * s[1].x + c * s[2].x + d * s[3].x, a * s[0].y + b * s[1].y + c * s[2].y + d * s[3].y)
+    };
+    // Cubic through q0..q3 at t = 0, 1/3, 2/3, 1: the inverse of the Bernstein matrix at those t.
+    let fit = |q: [Point; 4]| {
+        let c1 = |i: usize| (-5.0 * [q[0].x, q[0].y][i] + 18.0 * [q[1].x, q[1].y][i] - 9.0 * [q[2].x, q[2].y][i] + 2.0 * [q[3].x, q[3].y][i]) / 6.0;
+        let c2 = |i: usize| (2.0 * [q[0].x, q[0].y][i] - 9.0 * [q[1].x, q[1].y][i] + 18.0 * [q[2].x, q[2].y][i] - 5.0 * [q[3].x, q[3].y][i]) / 6.0;
+        [q[0], Point::new(c1(0), c1(1)), Point::new(c2(0), c2(1)), q[3]]
+    };
+    let mut out = path.clone();
+    for sp in &mut out.subpaths {
+        let n = sp.knots.len();
+        if n < 2 {
+            for k in &mut sp.knots {
+                *k = Knot { anchor: map(k.anchor), in_ctrl: map(k.in_ctrl), out_ctrl: map(k.out_ctrl), smooth: k.smooth };
+            }
+            continue;
+        }
+        let segs = sp.segments();
+        // Knots of the new subpath: the original knots (anchors mapped) with extra knots inside
+        // curved segments. `out_ctrl` of a knot and `in_ctrl` of the next come from the fits.
+        let mut knots: Vec<Knot> = sp.knots.iter().map(|k| Knot { anchor: map(k.anchor), in_ctrl: map(k.anchor), out_ctrl: map(k.anchor), smooth: k.smooth }).collect();
+        let mut inserted: Vec<(usize, Vec<Knot>)> = Vec::new();
+        for (i, s) in segs.iter().enumerate() {
+            let j = (i + 1) % n;
+            let straight = (s[1].x - s[0].x).abs() < 1e-9 && (s[1].y - s[0].y).abs() < 1e-9 && (s[2].x - s[3].x).abs() < 1e-9 && (s[2].y - s[3].y).abs() < 1e-9;
+            if straight {
+                continue;
+            }
+            // Mapped length of the curve (polyline estimate): one piece per ~20 px, at least 2.
+            let len: f64 = (0..16).map(|k| (map(eval(s, k as f64 / 16.0)), map(eval(s, (k + 1) as f64 / 16.0)))).map(|(a, b)| ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt()).sum();
+            let pieces = ((len / 20.0).ceil() as usize).clamp(2, 32);
+            let mut extra: Vec<Knot> = Vec::new();
+            for piece in 0..pieces {
+                let (t0, t1) = (piece as f64 / pieces as f64, (piece + 1) as f64 / pieces as f64);
+                let dt = (t1 - t0) / 3.0;
+                let q = [map(eval(s, t0)), map(eval(s, t0 + dt)), map(eval(s, t0 + 2.0 * dt)), map(eval(s, t1))];
+                let c = fit(q);
+                if piece == 0 {
+                    knots[i].out_ctrl = c[1];
+                } else {
+                    if let Some(k) = extra.last_mut() {
+                        k.out_ctrl = c[1];
+                    }
+                }
+                if piece + 1 == pieces {
+                    knots[j].in_ctrl = c[2];
+                } else {
+                    extra.push(Knot { anchor: c[3], in_ctrl: c[2], out_ctrl: c[3], smooth: true });
+                }
+            }
+            inserted.push((i, extra));
+        }
+        // Splice the extra knots in after their segment's first knot, from the back so indices hold.
+        for (i, extra) in inserted.into_iter().rev() {
+            let at = i + 1;
+            knots.splice(at..at, extra);
+        }
+        sp.knots = knots;
+    }
+    out
+}
+
+/// Distort / Perspective of a shape layer: the path is re-fitted through the projective map; the
+/// live rectangle / ellipse parameters no longer describe it, so it becomes a plain path.
+pub(crate) fn transform_shape_projective(sh: &mut ShapeLayer, h: &photocraft_algo::transform::Homography) {
+    sh.path = transform_path_projective(&sh.path, h);
+    sh.live = None;
+    sh.psd_raw = None;
+}
+
 /// Applies an affine transform to a shape's path, keeping the live shape when the transform
 /// is a translation plus axis-aligned scale (otherwise the shape stops being parametric).
 pub fn transform_shape(sh: &mut ShapeLayer, a: &Affine) {
